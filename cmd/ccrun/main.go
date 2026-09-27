@@ -474,12 +474,18 @@ func waitReady(pid uint32) error {
 }
 
 // hasInputBox reports whether the visible console has an empty prompt line. The
-// input box renders as a lone ">" between two rules; every other state that
-// shows a ">" -- the trust prompt's "> No, exit", a line already typed -- has
+// input box renders as a lone prompt glyph between two rules; every other state
+// that shows one -- the trust prompt's "> No, exit", a line already typed -- has
 // something after it.
+//
+// The glyph is "❯" when Claude Code thinks the terminal renders Unicode and ">"
+// otherwise. On Windows it decides that from the environment, which the session
+// inherits from ccrun's caller: WT_SESSION, TERM=xterm-256color (Git Bash, and
+// so any agent's Bash tool) or TERM_PROGRAM=vscode all give "❯".
 func hasInputBox(screen string) bool {
 	for _, line := range strings.Split(screen, "\n") {
-		if strings.TrimSpace(line) == ">" {
+		switch strings.TrimSpace(line) {
+		case ">", "❯":
 			return true
 		}
 	}
