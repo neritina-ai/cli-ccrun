@@ -54,6 +54,35 @@ func ProcessName(pid uint32) (string, error) {
 	return row.name, nil
 }
 
+// ProcessNames maps every running PID to its image name, from one snapshot.
+func ProcessNames() (map[uint32]string, error) {
+	procs, err := snapshotProcs()
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[uint32]string, len(procs))
+	for pid, row := range procs {
+		names[pid] = row.name
+	}
+	return names, nil
+}
+
+// StartTime returns when pid was created, as a FILETIME: 100-nanosecond
+// intervals since 1601 UTC. Together with the PID it identifies one process,
+// since Windows recycles PIDs but never a creation time under the same PID.
+func StartTime(pid uint32) (uint64, error) {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return 0, fmt.Errorf("open pid %d: %w", pid, err)
+	}
+	defer windows.CloseHandle(h)
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {
+		return 0, fmt.Errorf("GetProcessTimes pid %d: %w", pid, err)
+	}
+	return uint64(created.HighDateTime)<<32 | uint64(created.LowDateTime), nil
+}
+
 // Alive reports whether pid is still a running process. A process that has
 // exited but whose handle is still open (a "zombie") counts as gone.
 func Alive(pid uint32) bool {

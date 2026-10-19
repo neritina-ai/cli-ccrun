@@ -2,15 +2,21 @@
 // prompt, see what it is showing, or end it. It exists so that a third-party
 // tool -- an OpenClaw automation, a skill -- can open a session in a chosen
 // directory with Remote Control enabled, hand the operator its PID, and later
-// feed it prompts or shut it down, without anyone sitting at that terminal.
+// feed it prompts or shut it down, without anyone sitting at that terminal. A
+// session whose PID was not kept, or that ccrun did not start, is found by
+// keyword; and a session can be driven by the name it was started with instead
+// of its PID, which is what survives a claude --resume that brings it back
+// under a new PID.
 //
 // Forms:
 //
-//	ccrun -d <working-dir> [-r <remote-name>] [prompt]   start a session
-//	ccrun -p <pid> <prompt>                              inject a prompt
-//	ccrun -p <pid> -                                     inject a prompt from stdin
-//	ccrun -p <pid> -s                                    print what the session shows
-//	ccrun -p <pid> -q                                    end the session
+//	ccrun -d <working-dir> [-n <name>] [prompt]          start a session, or reuse it
+//	ccrun -n <name> <prompt>                             inject a prompt
+//	ccrun -n <name> -                                    inject a prompt from stdin
+//	ccrun -n <name> -s                                   print what the session shows
+//	ccrun -n <name> -q                                   end the session
+//	ccrun -p <pid> <prompt> | - | -s | -q                the same, by PID
+//	ccrun -l [keyword ...]                               find sessions and their PIDs
 //
 // One internal form, spawned by the public ones:
 //
@@ -42,6 +48,7 @@ import (
 
 	"github.com/neritina-ai/cli-ccrun/internal/coninject"
 	"github.com/neritina-ai/cli-ccrun/internal/launch"
+	"github.com/neritina-ai/cli-ccrun/internal/sessions"
 )
 
 const (
@@ -70,6 +77,10 @@ const (
 	// before the box appears.
 	readyGrace = 30 * time.Second
 
+	// nameGrace is how long a ready session is given to be listed under the
+	// name it was launched with, which takes a second or two.
+	nameGrace = 10 * time.Second
+
 	// quitGrace is how long "-q" waits for /exit to take effect. /exit is queued
 	// behind whatever turn is in flight, so this has to allow for a turn that is
 	// still wrapping up.
@@ -89,22 +100,34 @@ const (
 const usage = `ccrun - start and drive Claude Code sessions by PID
 
 usage:
-  ccrun -d <working-dir> [-r <remote-name>] [prompt]   start a session; prints its PID
-  ccrun -p <pid> <prompt>                              inject a prompt into that session
-  ccrun -p <pid> -                                     inject a prompt read from stdin
-  ccrun -p <pid> -s                                    print what that session is showing
-  ccrun -p <pid> -q                                    end that session
+  ccrun -d <working-dir> [-n <name>] [prompt]          start a session, or prompt the one
+                                                       already running; prints its PID
+  ccrun -n <name> <prompt>                             inject a prompt into that session
+  ccrun -n <name> -                                    inject a prompt read from stdin
+  ccrun -n <name> -s                                   print what that session is showing
+  ccrun -n <name> -q                                   end that session
+  ccrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
+  ccrun -l [keyword ...]                               list running sessions and their PIDs
 
 options:
   -d <dir>     working directory for the new session; created if missing
-  -r <name>    name identifying the session under Remote Control; defaults to
-               the working directory's name
+  -n <name>    the session's name. With -d it names the new session (default:
+               the working directory's name); if a session with this name is
+               already running in that directory, the prompt goes to it and no
+               new one starts, and if one is running in another directory,
+               nothing starts. Without -d it picks the running session with
+               this name: the whole name, ignoring case. The name stays with the
+               session through claude --resume; the PID does not.
   -p <pid>     act on the running session with this PID
-  -s           with -p: print the session's visible console text on stdout
-  -q           with -p: end the session
+  -s           with -p or -n: print the session's visible console text on stdout
+  -q           with -p or -n: end the session
+  -l           list running sessions, one per line with the PID first; with
+               keywords, only those whose name, directory or session ID
+               contains every keyword (case-insensitive)
 
-A launch prints the new session's PID on stdout. Everything exits 0 on success
-and 1 on failure.`
+-d prints the session's PID on stdout, whether it started the session or found
+it running. Everything exits 0 on success and 1 on failure; -l fails when no
+session matches.`
 
 func main() {
 	// The internal subcommand is dispatched before flag parsing so its
@@ -121,10 +144,11 @@ func main() {
 	fs.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
 	var (
 		dir    = fs.String("d", "", "working directory for the new session")
-		remote = fs.String("r", "", "name identifying the session under Remote Control")
 		pid    = fs.Uint("p", 0, "act on the session with this PID")
-		screen = fs.Bool("s", false, "with -p: print the session's visible console text")
-		quit   = fs.Bool("q", false, "with -p: end the session")
+		name   = fs.String("n", "", "the session's name: names a new one with -d, picks a running one otherwise")
+		screen = fs.Bool("s", false, "with -p or -n: print the session's visible console text")
+		quit   = fs.Bool("q", false, "with -p or -n: end the session")
+		list   = fs.Bool("l", false, "list running sessions matching every keyword")
 	)
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(exitError)
@@ -132,10 +156,11 @@ func main() {
 
 	err := run(options{
 		dir:    *dir,
-		remote: *remote,
 		pid:    uint32(*pid),
+		name:   *name,
 		screen: *screen,
 		quit:   *quit,
+		list:   *list,
 		args:   fs.Args(),
 	})
 	if err != nil {
@@ -146,50 +171,72 @@ func main() {
 
 type options struct {
 	dir    string
-	remote string
 	pid    uint32
+	name   string
 	screen bool
 	quit   bool
+	list   bool
 	args   []string
 }
 
 // run dispatches to one of the public forms.
 func run(o options) error {
 	switch {
-	case o.pid != 0 && o.dir != "":
-		return fmt.Errorf("-p and -d are different modes; use one\n%s", usage)
-
-	case o.pid != 0:
-		if o.quit && o.screen {
-			return fmt.Errorf("-s and -q are different modes; use one\n%s", usage)
+	case o.list:
+		if o.pid != 0 || o.name != "" || o.dir != "" || o.screen || o.quit {
+			return fmt.Errorf("-l takes only keywords\n%s", usage)
 		}
-		if o.quit || o.screen {
-			if len(o.args) > 0 {
-				return fmt.Errorf("-s and -q take no prompt\n%s", usage)
-			}
-			if o.screen {
-				return showScreen(o.pid)
-			}
-			return quitSession(o.pid)
-		}
-		prompt, err := readPrompt(o.args)
-		if err != nil {
-			return err
-		}
-		if prompt == "" {
-			return fmt.Errorf("nothing to inject: give a prompt, \"-\" to read one from stdin, -s to see the screen, or -q to end the session\n%s", usage)
-		}
-		return injectPrompt(o.pid, prompt)
-
-	case o.quit || o.screen:
-		return fmt.Errorf("-s and -q need -p <pid>\n%s", usage)
+		return listSessions(o.args)
 
 	case o.dir != "":
+		if o.pid != 0 || o.screen || o.quit {
+			return fmt.Errorf("-d starts a new session; -p, -s and -q act on a running one\n%s", usage)
+		}
 		prompt, err := readPrompt(o.args)
 		if err != nil {
 			return err
 		}
 		return startSession(o, prompt)
+
+	case o.pid != 0 && o.name != "":
+		return fmt.Errorf("-p and -n both pick a running session; use one\n%s", usage)
+
+	case o.pid != 0 || o.name != "":
+		if o.quit && o.screen {
+			return fmt.Errorf("-s and -q are different modes; use one\n%s", usage)
+		}
+		var prompt string
+		if o.quit || o.screen {
+			if len(o.args) > 0 {
+				return fmt.Errorf("-s and -q take no prompt\n%s", usage)
+			}
+		} else {
+			var err error
+			if prompt, err = readPrompt(o.args); err != nil {
+				return err
+			}
+			if prompt == "" {
+				return fmt.Errorf("nothing to inject: give a prompt, \"-\" to read one from stdin, -s to see the screen, or -q to end the session\n%s", usage)
+			}
+		}
+
+		pid := o.pid
+		if o.name != "" {
+			var err error
+			if pid, err = pidByName(o.name); err != nil {
+				return err
+			}
+		}
+		switch {
+		case o.screen:
+			return showScreen(pid)
+		case o.quit:
+			return quitSession(pid)
+		}
+		return injectPrompt(pid, prompt)
+
+	case o.quit || o.screen:
+		return fmt.Errorf("-s and -q need -p <pid> or -n <name>\n%s", usage)
 
 	default:
 		return errors.New(usage)
@@ -218,9 +265,36 @@ func readPrompt(args []string) (string, error) {
 }
 
 // startSession creates the working directory, launches Claude Code there with
-// Remote Control enabled, and prints the PID that every later command takes.
+// Remote Control enabled, and prints the PID that every later command takes --
+// unless the session it would launch is already running.
 func startSession(o options, prompt string) error {
-	dir, err := launch.EnsureDir(o.dir)
+	abs, err := filepath.Abs(o.dir)
+	if err != nil {
+		return err
+	}
+	name := o.name
+	if name == "" {
+		name = defaultName(abs)
+	}
+	// The name is how -n finds this session later, which only works while no
+	// other running session has it; Claude Code itself lets names repeat. A
+	// session that already has the name and works in this directory is the one
+	// this would start, so it gets the prompt instead: a schedule can run the
+	// same launch every time and keep one session going.
+	taken, err := sessionsNamed(name)
+	if err != nil {
+		return err
+	}
+	switch {
+	case len(taken) == 1 && sameDir(taken[0].Dir, abs):
+		return reuseSession(taken[0], prompt)
+	case len(taken) == 1:
+		return fmt.Errorf("session %d is already named %q and works in %s, not %s; end that one (ccrun -n %q -q) or give this one another name with -n", taken[0].PID, name, taken[0].Dir, abs, name)
+	case len(taken) > 1:
+		return fmt.Errorf("%d running sessions are named %q (pids %s), so -n cannot pick out one; end all but one or give this one another name with -n", len(taken), name, pidList(taken))
+	}
+
+	dir, err := launch.EnsureDir(abs)
 	if err != nil {
 		return err
 	}
@@ -229,14 +303,12 @@ func startSession(o options, prompt string) error {
 		return fmt.Errorf("claude not found on PATH: %w", err)
 	}
 
-	name := o.remote
-	if name == "" {
-		name = defaultRemoteName(dir)
-	}
-	// --remote-control turns Remote Control on and names it; --name is what
-	// labels the session in the UI the operator is looking at (its prompt box,
-	// the terminal title, the session picker), which is what -r is for. Both get
-	// the same name.
+	// --name is the session's own name: its prompt box, terminal title and
+	// /resume picker show it, its session record carries it for -n to find, and
+	// claude --resume keeps it. --remote-control turns Remote Control on, and
+	// gets the same name so that the Remote Control list shows the same thing;
+	// it can only be read back on claude.ai, so it could never be what -n goes
+	// by.
 	args := []string{"--remote-control", name, "--name", name}
 	if prompt != "" {
 		args = append(args, prompt)
@@ -260,6 +332,8 @@ func startSession(o options, prompt string) error {
 	}
 	if _, err := helper(pid, "ready", ""); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: session %d is not ready for prompts: %v\n", pid, err)
+	} else if err := waitNamed(pid, name); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: -n %s may not find session %d yet: %v\n", name, pid, err)
 	}
 
 	// The PID is what this form is for, so stdout carries it and nothing else;
@@ -269,11 +343,57 @@ func startSession(o options, prompt string) error {
 	return nil
 }
 
-// defaultRemoteName names a session after its working directory when -r is
-// omitted. The name is never left empty: --remote-control's argument is
+// reuseSession stands in for a launch whose session is already running: the
+// prompt, if any, is injected instead of opening a second session, and the PID
+// is printed just as a launch prints it.
+func reuseSession(s sessions.Session, prompt string) error {
+	if prompt != "" {
+		if err := injectPrompt(s.PID, prompt); err != nil {
+			return err
+		}
+	}
+	fmt.Println(s.PID)
+	fmt.Fprintf(os.Stderr, "claude is already running in %s as %q (pid %d); no new session started\n", s.Dir, s.Name, s.PID)
+	return nil
+}
+
+// sameDir reports whether two absolute paths name the same directory, the way
+// Windows compares them: ignoring case and a trailing separator.
+func sameDir(a, b string) bool {
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
+// waitNamed blocks until the session is listed under name, so that -n finds it
+// as soon as its launch returns. Claude Code files a new session under a
+// placeholder name and applies the one it was given a second or two after the
+// input box appears, which is where a launch would otherwise return.
+func waitNamed(pid uint32, name string) error {
+	deadline := time.Now().Add(nameGrace)
+	for {
+		all, err := sessions.Running()
+		if err == nil {
+			for _, s := range all {
+				if s.PID == pid && strings.EqualFold(s.Name, name) {
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("not listed under that name after %s", nameGrace)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// defaultName names a session after its working directory when -n is omitted.
+// A session is never left unnamed: Claude Code would make up a name that
+// changes on every claude --resume, and --remote-control's argument is
 // optional on claude's side, so a bare flag would swallow the prompt that
 // follows it as its value.
-func defaultRemoteName(dir string) string {
+func defaultName(dir string) string {
 	name := strings.TrimRight(filepath.ToSlash(dir), "/")
 	if i := strings.LastIndex(name, "/"); i >= 0 {
 		name = name[i+1:]
@@ -346,6 +466,128 @@ func quitSession(pid uint32) error {
 	}
 	fmt.Fprintf(os.Stderr, "session %d terminated\n", pid)
 	return nil
+}
+
+// listSessions prints the running sessions that match every keyword, so a
+// caller holding a name, a directory or a session URL can get the PID that -p
+// takes. Making the keywords specific enough to leave one session is up to the
+// caller; when several match, all of them are listed to choose from.
+//
+// Each session is one line on stdout, PID first, so awk '{print $1}' or
+// PowerShell's .Split()[0] gets the PID. The column header is for a person and
+// goes to stderr.
+func listSessions(keywords []string) error {
+	all, err := sessions.Running()
+	if err != nil {
+		return err
+	}
+	var found []sessions.Session
+	for _, s := range all {
+		if s.Matches(keywords) {
+			found = append(found, s)
+		}
+	}
+	if len(found) == 0 {
+		if len(keywords) == 0 {
+			return errors.New("no Claude Code session is running")
+		}
+		return fmt.Errorf("no running session matches %s", quoteAll(keywords))
+	}
+
+	rows := [][]string{{"PID", "NAME", "STATUS", "DIRECTORY"}}
+	for _, s := range found {
+		rows = append(rows, []string{strconv.FormatUint(uint64(s.PID), 10), orDash(s.Name), orDash(s.Status), orDash(s.Dir)})
+	}
+	widths := make([]int, len(rows[0]))
+	for _, row := range rows {
+		for i, cell := range row {
+			widths[i] = max(widths[i], len([]rune(cell)))
+		}
+	}
+	for i, row := range rows {
+		var line strings.Builder
+		for j, cell := range row {
+			line.WriteString(cell)
+			if j < len(row)-1 {
+				line.WriteString(strings.Repeat(" ", widths[j]-len([]rune(cell))+2))
+			}
+		}
+		out := os.Stdout
+		if i == 0 {
+			out = os.Stderr
+		}
+		fmt.Fprintln(out, line.String())
+	}
+
+	if len(found) > 1 && len(keywords) > 0 {
+		fmt.Fprintf(os.Stderr, "%d sessions match; add or lengthen keywords to leave one\n", len(found))
+	}
+	return nil
+}
+
+// pidByName finds the one running session called name, ignoring case. It is
+// what keeps hold of a session across a restart: claude --resume brings a
+// session back under a new PID but with its name. Unlike -l's keywords this is
+// no partial match, because whatever it finds is about to be typed into: the
+// name has to be the session's whole name, and a name two sessions share picks
+// neither. A launch keeps its own names unique, but a session started by hand,
+// or renamed with /rename, can still share one.
+func pidByName(name string) (uint32, error) {
+	found, err := sessionsNamed(name)
+	if err != nil {
+		return 0, err
+	}
+	switch len(found) {
+	case 0:
+		return 0, fmt.Errorf("no running session is named %q; ccrun -l lists them", name)
+	case 1:
+		return found[0].PID, nil
+	}
+	return 0, fmt.Errorf("%d running sessions are named %q (pids %s); pick one with -p", len(found), name, pidList(found))
+}
+
+// pidList renders the sessions' PIDs for an error message.
+func pidList(found []sessions.Session) string {
+	pids := make([]string, len(found))
+	for i, s := range found {
+		pids[i] = strconv.FormatUint(uint64(s.PID), 10)
+	}
+	return strings.Join(pids, ", ")
+}
+
+// sessionsNamed returns the running sessions whose whole name is name, ignoring
+// case.
+func sessionsNamed(name string) ([]sessions.Session, error) {
+	all, err := sessions.Running()
+	if err != nil {
+		return nil, err
+	}
+	var found []sessions.Session
+	for _, s := range all {
+		if strings.EqualFold(s.Name, name) {
+			found = append(found, s)
+		}
+	}
+	return found, nil
+}
+
+// quoteAll renders keywords for an error message, each quoted so that an empty
+// keyword or a stray space is visible.
+func quoteAll(keywords []string) string {
+	quoted := make([]string, len(keywords))
+	for i, k := range keywords {
+		quoted[i] = strconv.Quote(k)
+	}
+	return strings.Join(quoted, " ")
+}
+
+// orDash stands in for a field a session record left empty, so every line has
+// the same columns.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // checkSession refuses to type into anything that is not a Claude Code session,
