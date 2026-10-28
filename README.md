@@ -144,6 +144,10 @@ Prints the session's visible console text: its last messages, whatever is
 half-typed in its input box, or a prompt it is waiting on. Nobody is watching
 that window, so this is how a caller sees what state it is in.
 
+A frozen session looks just like an idle one, so when the session's console has
+a selection in it -- which freezes it, see Notes -- a warning on stderr says so.
+stdout is the screen either way.
+
 ### End a session
 
 ```
@@ -167,6 +171,23 @@ transcript as it goes, so either way the conversation is still there to resume.
   even when ccrun was run from inside another Claude Code session.
 - A minimized session takes prompts exactly like a visible one, and stays
   minimized when one arrives -- it never pops to the front.
+- A selection in a session's console window -- a click or drag in it with
+  QuickEdit on, or Mark or Select All from its window menu -- freezes the
+  session. The console holds the session's output while the selection lasts,
+  and Claude Code stops at its next write: no turn starts, no background-task
+  notification is taken, nothing typed is read. When the selection ends,
+  everything that waited goes through at once. The only sign is the title bar,
+  where "Select" or "Mark" comes before the name, and a minimized window does
+  not show it. So before minimizing a session window you have been reading,
+  look at its title and press Escape if it shows a selection -- only then,
+  because Escape anywhere else interrupts Claude Code.
+- Injecting a prompt, and `-q`, end such a selection first and say so on
+  stderr. They do it by sending Escape to the window, which the console keeps
+  for itself while selecting, and only when there is a selection. A selection
+  that cannot be ended gets a warning, and the prompt is typed anyway: it waits
+  in the input buffer until the selection is gone. Between injections nothing
+  ends it, so a session frozen this way also misses its background-task
+  notifications until then.
 - `-l` and `-n` read the record Claude Code keeps of each running session under
   `~/.claude/sessions` (or `%CLAUDE_CONFIG_DIR%\sessions`), checked against the
   live process so a record left behind by a crashed session is not listed. That

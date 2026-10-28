@@ -119,8 +119,12 @@ func Start(o Options) (uint32, error) {
 	// SW_SHOWMINNOACTIVE additionally keeps the new window from stealing focus
 	// from whatever they were doing. Nothing else is affected: keystrokes go
 	// into the console's input buffer rather than through its window, so a
-	// minimized session takes prompts exactly like a visible one -- and it stays
-	// on the taskbar, so a person can still open it and take over.
+	// minimized session takes prompts, and its task notifications, exactly like
+	// a visible one -- and it stays on the taskbar, so a person can still open
+	// it and take over. What does freeze a session, minimized or not, is a
+	// selection left in its window by someone who opened it; minimizing only
+	// hides the title bar that would show it. ccrun ends one before typing (see
+	// coninject.Thaw).
 	si.Flags = windows.STARTF_USESHOWWINDOW
 	si.ShowWindow = windows.SW_SHOWMINNOACTIVE
 	var pi windows.ProcessInformation

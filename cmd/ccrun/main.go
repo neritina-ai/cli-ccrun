@@ -25,7 +25,11 @@
 // The session is launched with CREATE_NEW_CONSOLE so it owns a console, and
 // every later command reaches it the way neritina-ai/self-compact reaches its
 // own session: AttachConsole to that console and WriteConsoleInputW straight
-// into its input buffer. Nothing depends on window focus.
+// into its input buffer. Nothing depends on window focus, or on whether the
+// window is minimized. What does stop a session is a selection left in its
+// console window: conhost holds the session's output while there is one, and
+// the session freezes at its next write. Injecting ends such a selection first
+// (coninject.Thaw), and -s warns about one.
 //
 // Console work runs in a short-lived child process (__inject) because
 // AttachConsole requires first calling FreeConsole, which would tear down this
@@ -619,12 +623,17 @@ func helper(pid uint32, mode, text string) (string, error) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
+	msg := strings.TrimSpace(stderr.String())
 	if err != nil {
-		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
 		return "", errors.New(msg)
+	}
+	// What the child reports on success -- a selection it ended, say -- is for
+	// whoever ran ccrun, so it is passed on.
+	if msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
 	}
 	return string(out), nil
 }
@@ -651,6 +660,11 @@ func runInject(args []string) error {
 		if err != nil {
 			return err
 		}
+		// A frozen session looks like an idle one, so the screen cannot show
+		// it. stdout stays the screen alone; the warning goes beside it.
+		if sel, err := coninject.Selecting(pid); err == nil && sel {
+			fmt.Fprintln(os.Stderr, "warning: the session's console has a selection in it, so the session is frozen until that selection ends; injecting a prompt ends it")
+		}
 		_, err = os.Stdout.WriteString(text)
 		return err
 	}
@@ -671,6 +685,17 @@ func runInject(args []string) error {
 		signal.Ignore(os.Interrupt)
 	default:
 		return fmt.Errorf("unknown mode %q", args[1])
+	}
+
+	// A session whose console has a selection in it is frozen, and what is
+	// typed would sit unread in its input buffer until someone ended the
+	// selection. Typing goes ahead even when that fails: the buffer still takes
+	// it, and the session reads it once the selection is gone.
+	switch thawed, err := coninject.Thaw(pid); {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "warning: %v; typing anyway, and the session reads it once that selection ends\n", err)
+	case thawed:
+		fmt.Fprintln(os.Stderr, "ended a selection in the session's console that was freezing the session")
 	}
 	return coninject.Inject(pid, steps)
 }

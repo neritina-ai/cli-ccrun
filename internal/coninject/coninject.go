@@ -6,7 +6,9 @@
 //
 // It is a lightly extended copy of the package of the same name in
 // neritina-ai/self-compact. The additions are arrow and Ctrl-chord steps, the
-// console screen reader in screen.go, and the process helpers in process.go.
+// console screen reader in screen.go, the process helpers in process.go, and
+// the handling of a console selection, which freezes a session, in
+// selection.go.
 package coninject
 
 import (
