@@ -43,8 +43,8 @@ type record struct {
 	BridgeSessionID string `json:"bridgeSessionId"`
 }
 
-// configDir is where Claude Code keeps its state, which CLAUDE_CONFIG_DIR moves.
-func configDir() (string, error) {
+// ConfigDir is where Claude Code keeps its state, which CLAUDE_CONFIG_DIR moves.
+func ConfigDir() (string, error) {
 	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
 		return dir, nil
 	}
@@ -57,7 +57,7 @@ func configDir() (string, error) {
 
 // Running returns every running session, oldest first.
 func Running() ([]Session, error) {
-	dir, err := configDir()
+	dir, err := ConfigDir()
 	if err != nil {
 		return nil, err
 	}

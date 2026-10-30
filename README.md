@@ -18,6 +18,8 @@ ccrun -n <name> -s                                   print what that session is 
 ccrun -n <name> -q                                   end that session
 ccrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
 ccrun -l [keyword ...]                               list running sessions and their PIDs
+ccrun -m <old-dir> <new-dir>                         after a working directory was renamed or
+                                                     moved, move what Claude Code keeps for it
 ```
 
 So the person who launched it can pick it up from their phone or from
@@ -158,6 +160,29 @@ ccrun -n nightly-build -q
 session that has not gone by then is terminated. Claude Code writes its
 transcript as it goes, so either way the conversation is still there to resume.
 
+### Rename a working directory
+
+```
+ren D:\work\nightly nightly-builds
+ccrun -m D:\work\nightly D:\work\nightly-builds
+```
+
+Claude Code keeps a working directory's transcripts and auto memory in a folder
+named after the directory's path, under `~/.claude/projects` (or
+`%CLAUDE_CONFIG_DIR%\projects`). Rename or move the directory and a session
+started there begins with none of it: no memory, nothing for `/resume`. `-m`
+renames that folder for the new path. Auto memory is filed under the git
+repository's root rather than the working directory, so it moves with the
+directory when that is a repository's root or not in a repository at all; a
+subdirectory's or a worktree's memory stays under the repository's folder.
+
+Move the directory first: `-m` refuses while the new path does not exist or the
+old one still does, and while a session is working in either. It never
+overwrites or merges into what Claude Code already keeps for the new path. When
+nothing was kept for the old path it says so and exits 0. Workspace trust and
+the other per-directory settings in `~/.claude.json` stay with the old path;
+`-d` answers the trust question again in the new one.
+
 ## Notes
 
 - Injection is typing, so pending text in the input box gets whatever is
@@ -201,6 +226,7 @@ Built with **Claude Opus 5** and **Claude Opus 5.5**.
 ```
 go build ./cmd/ccrun
 go vet ./...
+go test ./...
 ```
 
 ## License

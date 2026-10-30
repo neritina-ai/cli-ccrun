@@ -17,6 +17,7 @@
 //	ccrun -n <name> -q                                   end the session
 //	ccrun -p <pid> <prompt> | - | -s | -q                the same, by PID
 //	ccrun -l [keyword ...]                               find sessions and their PIDs
+//	ccrun -m <old-dir> <new-dir>                         carry a moved directory's data over
 //
 // One internal form, spawned by the public ones:
 //
@@ -52,6 +53,7 @@ import (
 
 	"github.com/neritina-ai/cli-ccrun/internal/coninject"
 	"github.com/neritina-ai/cli-ccrun/internal/launch"
+	"github.com/neritina-ai/cli-ccrun/internal/projects"
 	"github.com/neritina-ai/cli-ccrun/internal/sessions"
 )
 
@@ -112,6 +114,8 @@ usage:
   ccrun -n <name> -q                                   end that session
   ccrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
   ccrun -l [keyword ...]                               list running sessions and their PIDs
+  ccrun -m <old-dir> <new-dir>                         after a working directory was renamed or
+                                                       moved, move what Claude Code keeps for it
 
 options:
   -d <dir>     working directory for the new session; created if missing
@@ -128,6 +132,10 @@ options:
   -l           list running sessions, one per line with the PID first; with
                keywords, only those whose name, directory or session ID
                contains every keyword (case-insensitive)
+  -m           move the transcripts and auto memory Claude Code keeps for
+               <old-dir> to where it looks for them in <new-dir>. Move the
+               directory first: <new-dir> must exist and <old-dir> must not.
+               Nothing is overwritten, and no session may be working in either.
 
 -d prints the session's PID on stdout, whether it started the session or found
 it running. Everything exits 0 on success and 1 on failure; -l fails when no
@@ -153,6 +161,7 @@ func main() {
 		screen = fs.Bool("s", false, "with -p or -n: print the session's visible console text")
 		quit   = fs.Bool("q", false, "with -p or -n: end the session")
 		list   = fs.Bool("l", false, "list running sessions matching every keyword")
+		move   = fs.Bool("m", false, "move what Claude Code keeps for a working directory that moved")
 	)
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(exitError)
@@ -165,6 +174,7 @@ func main() {
 		screen: *screen,
 		quit:   *quit,
 		list:   *list,
+		move:   *move,
 		args:   fs.Args(),
 	})
 	if err != nil {
@@ -180,12 +190,19 @@ type options struct {
 	screen bool
 	quit   bool
 	list   bool
+	move   bool
 	args   []string
 }
 
 // run dispatches to one of the public forms.
 func run(o options) error {
 	switch {
+	case o.move:
+		if o.pid != 0 || o.name != "" || o.dir != "" || o.screen || o.quit || o.list || len(o.args) != 2 {
+			return fmt.Errorf("-m takes the directory's old path and its new one, nothing else\n%s", usage)
+		}
+		return moveData(o.args[0], o.args[1])
+
 	case o.list:
 		if o.pid != 0 || o.name != "" || o.dir != "" || o.screen || o.quit {
 			return fmt.Errorf("-l takes only keywords\n%s", usage)
@@ -365,6 +382,57 @@ func reuseSession(s sessions.Session, prompt string) error {
 // Windows compares them: ignoring case and a trailing separator.
 func sameDir(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
+// within reports whether dir is root or somewhere inside it, ignoring case.
+func within(dir, root string) bool {
+	dir, root = strings.ToLower(filepath.Clean(dir)), strings.ToLower(filepath.Clean(root))
+	return dir == root || strings.HasPrefix(dir, strings.TrimRight(root, `\/`)+string(filepath.Separator))
+}
+
+// moveData carries what Claude Code keeps for a working directory -- its
+// transcripts and auto memory -- over to the directory's new path, so that a
+// session started there picks up where the old ones left off. The directory
+// has to have moved already: the data follows it, never the other way round.
+func moveData(from, to string) error {
+	from, err := filepath.Abs(from)
+	if err != nil {
+		return err
+	}
+	if to, err = filepath.Abs(to); err != nil {
+		return err
+	}
+	if info, err := os.Stat(to); err != nil || !info.IsDir() {
+		return fmt.Errorf("%s is not a directory; move the directory first, then its data", to)
+	}
+	if _, err := os.Stat(from); err == nil && !sameDir(from, to) {
+		return fmt.Errorf("%s still exists; -m is for after the directory has moved", from)
+	}
+	// A running session would go on writing where the data was, or already
+	// writes where it is going.
+	all, err := sessions.Running()
+	if err != nil {
+		return err
+	}
+	for _, s := range all {
+		if within(s.Dir, from) || within(s.Dir, to) {
+			return fmt.Errorf("session %d is working in %s; end it first (ccrun -p %d -q)", s.PID, s.Dir, s.PID)
+		}
+	}
+	config, err := sessions.ConfigDir()
+	if err != nil {
+		return err
+	}
+	dst, err := projects.Move(config, from, to)
+	if err != nil {
+		return err
+	}
+	if dst == "" {
+		fmt.Fprintf(os.Stderr, "claude keeps nothing for %s; nothing to move\n", from)
+	} else {
+		fmt.Fprintf(os.Stderr, "moved what claude keeps for %s to %s\n", from, dst)
+	}
+	return nil
 }
 
 // waitNamed blocks until the session is listed under name, so that -n finds it
