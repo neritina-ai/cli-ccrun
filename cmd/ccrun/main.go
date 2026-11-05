@@ -10,18 +10,19 @@
 //
 // Forms:
 //
-//	ccrun -d <working-dir> [-n <name>] [prompt]          start a session, or reuse it
-//	ccrun -n <name> <prompt>                             inject a prompt
-//	ccrun -n <name> -                                    inject a prompt from stdin
+//	ccrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or reuse it
+//	ccrun -n <name> <prompt> [-q]                        inject a prompt
+//	ccrun -n <name> - [-q]                               inject a prompt from stdin
 //	ccrun -n <name> -s                                   print what the session shows
-//	ccrun -n <name> -q                                   end the session
+//	ccrun -n <name> -q                                   end the session after its turn
 //	ccrun -p <pid> <prompt> | - | -s | -q                the same, by PID
 //	ccrun -l [keyword ...]                               find sessions and their PIDs
 //	ccrun -m <old-dir> <new-dir>                         carry a moved directory's data over
 //
-// One internal form, spawned by the public ones:
+// Two internal forms, spawned by the public ones:
 //
 //	ccrun __inject <pid> <ready|prompt|quit|screen>
+//	ccrun __quit <pid> <since-unix-ms>                   end the session after its turn
 //
 // The session is launched with CREATE_NEW_CONSOLE so it owns a console, and
 // every later command reaches it the way neritina-ai/self-compact reaches its
@@ -49,7 +50,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/neritina-ai/cli-ccrun/internal/coninject"
 	"github.com/neritina-ai/cli-ccrun/internal/launch"
@@ -60,6 +64,18 @@ import (
 const (
 	// injectCmd is the internal subcommand that does the console work.
 	injectCmd = "__inject"
+
+	// quitCmd is the internal subcommand that waits for a session's turn to
+	// end and then ends the session.
+	quitCmd = "__quit"
+
+	// idleSettle is how long a session has to stay idle before a waiting -q
+	// takes that for the end of its turn rather than a gap between two.
+	idleSettle = 3 * time.Second
+
+	// quitWatchLimit bounds how long a waiting -q keeps watching a session that
+	// never finishes its turn -- one stuck on a permission prompt, say.
+	quitWatchLimit = 24 * time.Hour
 
 	// exitError is the exit code for any failure; success is always 0.
 	exitError = 1
@@ -87,9 +103,9 @@ const (
 	// name it was launched with, which takes a second or two.
 	nameGrace = 10 * time.Second
 
-	// quitGrace is how long "-q" waits for /exit to take effect. /exit is queued
-	// behind whatever turn is in flight, so this has to allow for a turn that is
-	// still wrapping up.
+	// quitGrace is how long "-q" waits for /exit to take effect. /exit acts the
+	// moment it is typed, even mid-turn, which is why -q only sends it once the
+	// turn is over; this covers a session slow to shut down.
 	quitGrace = 10 * time.Second
 
 	// trustMarker identifies the workspace-trust prompt in the session's visible
@@ -106,12 +122,12 @@ const (
 const usage = `ccrun - start and drive Claude Code sessions by PID
 
 usage:
-  ccrun -d <working-dir> [-n <name>] [prompt]          start a session, or prompt the one
+  ccrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or prompt the one
                                                        already running; prints its PID
-  ccrun -n <name> <prompt>                             inject a prompt into that session
-  ccrun -n <name> -                                    inject a prompt read from stdin
+  ccrun -n <name> <prompt> [-q]                        inject a prompt into that session
+  ccrun -n <name> - [-q]                               inject a prompt read from stdin
   ccrun -n <name> -s                                   print what that session is showing
-  ccrun -n <name> -q                                   end that session
+  ccrun -n <name> -q                                   end that session once its turn is done
   ccrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
   ccrun -l [keyword ...]                               list running sessions and their PIDs
   ccrun -m <old-dir> <new-dir>                         after a working directory was renamed or
@@ -128,7 +144,13 @@ options:
                session through claude --resume; the PID does not.
   -p <pid>     act on the running session with this PID
   -s           with -p or -n: print the session's visible console text on stdout
-  -q           with -p or -n: end the session
+  -q           end the session at the end of its turn, never in the middle of
+               one: an idle session ends now; a busy one -- background commands
+               included -- ends once it is done, while ccrun returns at once.
+               With a prompt, the session ends once that prompt's turn is
+               done; with -d, a prompt is required
+  --           everything after it is prompt text; flags may otherwise come
+               before or after the prompt
   -l           list running sessions, one per line with the PID first; with
                keywords, only those whose name, directory or session ID
                contains every keyword (case-insensitive)
@@ -144,8 +166,12 @@ session matches.`
 func main() {
 	// The internal subcommand is dispatched before flag parsing so its
 	// arguments are never mistaken for ccrun's own.
-	if len(os.Args) > 1 && os.Args[1] == injectCmd {
-		if err := runInject(os.Args[2:]); err != nil {
+	if len(os.Args) > 1 && (os.Args[1] == injectCmd || os.Args[1] == quitCmd) {
+		sub := runInject
+		if os.Args[1] == quitCmd {
+			sub = runQuitWatch
+		}
+		if err := sub(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(exitError)
 		}
@@ -163,11 +189,12 @@ func main() {
 		list   = fs.Bool("l", false, "list running sessions matching every keyword")
 		move   = fs.Bool("m", false, "move what Claude Code keeps for a working directory that moved")
 	)
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	args, err := parseInterleaved(fs, os.Args[1:])
+	if err != nil {
 		os.Exit(exitError)
 	}
 
-	err := run(options{
+	err = run(options{
 		dir:    *dir,
 		pid:    uint32(*pid),
 		name:   *name,
@@ -175,11 +202,39 @@ func main() {
 		quit:   *quit,
 		list:   *list,
 		move:   *move,
-		args:   fs.Args(),
+		args:   args,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ccrun:", err)
 		os.Exit(exitError)
+	}
+}
+
+// parseInterleaved parses flags wherever they stand among the arguments, so
+// that "ccrun -p <pid> <prompt> -q" means what it reads as; the flag package
+// alone stops at the first argument that is not a flag. A prompt is still one
+// argument however many words it has, so a dash inside it is never mistaken
+// for a flag; only an argument that is a flag on its own is. Everything after
+// "--" is taken as it is.
+func parseInterleaved(fs *flag.FlagSet, all []string) ([]string, error) {
+	var rest []string
+	args := all
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		args = fs.Args()
+		if len(args) == 0 {
+			return rest, nil
+		}
+		// The flag package consumes a "--" and reports everything after it as
+		// arguments. args is always a tail of all, so whether it did is told by
+		// the argument just before that tail.
+		if i := len(all) - len(args); i > 0 && all[i-1] == "--" {
+			return append(rest, args...), nil
+		}
+		rest = append(rest, args[0])
+		args = args[1:]
 	}
 }
 
@@ -210,12 +265,15 @@ func run(o options) error {
 		return listSessions(o.args)
 
 	case o.dir != "":
-		if o.pid != 0 || o.screen || o.quit {
-			return fmt.Errorf("-d starts a new session; -p, -s and -q act on a running one\n%s", usage)
+		if o.pid != 0 || o.screen {
+			return fmt.Errorf("-d starts a new session; -p and -s act on a running one\n%s", usage)
 		}
 		prompt, err := readPrompt(o.args)
 		if err != nil {
 			return err
+		}
+		if o.quit && prompt == "" {
+			return fmt.Errorf("-d with -q needs a prompt: the session ends once that prompt's turn is done\n%s", usage)
 		}
 		return startSession(o, prompt)
 
@@ -227,11 +285,17 @@ func run(o options) error {
 			return fmt.Errorf("-s and -q are different modes; use one\n%s", usage)
 		}
 		var prompt string
-		if o.quit || o.screen {
+		switch {
+		case o.screen:
 			if len(o.args) > 0 {
-				return fmt.Errorf("-s and -q take no prompt\n%s", usage)
+				return fmt.Errorf("-s takes no prompt\n%s", usage)
 			}
-		} else {
+		case o.quit:
+			var err error
+			if prompt, err = readPrompt(o.args); err != nil {
+				return err
+			}
+		default:
 			var err error
 			if prompt, err = readPrompt(o.args); err != nil {
 				return err
@@ -251,8 +315,10 @@ func run(o options) error {
 		switch {
 		case o.screen:
 			return showScreen(pid)
+		case o.quit && prompt == "":
+			return quitAtEndOfTurn(pid)
 		case o.quit:
-			return quitSession(pid)
+			return promptThenQuit(pid, prompt)
 		}
 		return injectPrompt(pid, prompt)
 
@@ -308,7 +374,7 @@ func startSession(o options, prompt string) error {
 	}
 	switch {
 	case len(taken) == 1 && sameDir(taken[0].Dir, abs):
-		return reuseSession(taken[0], prompt)
+		return reuseSession(taken[0], prompt, o.quit)
 	case len(taken) == 1:
 		return fmt.Errorf("session %d is already named %q and works in %s, not %s; end that one (ccrun -n %q -q) or give this one another name with -n", taken[0].PID, name, taken[0].Dir, abs, name)
 	case len(taken) > 1:
@@ -351,8 +417,16 @@ func startSession(o options, prompt string) error {
 	if !coninject.Alive(pid) {
 		return fmt.Errorf("claude exited immediately after starting in %s (pid %d)", dir, pid)
 	}
-	if _, err := helper(pid, "ready", ""); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: session %d is not ready for prompts: %v\n", pid, err)
+	_, readyErr := helper(pid, "ready", "")
+	// The prompt's turn is the first status change after the input box shows
+	// up; the session files itself as idle before that, while it starts.
+	if o.quit {
+		if err := watchQuit(pid, time.Now()); err != nil {
+			return err
+		}
+	}
+	if readyErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: session %d is not ready for prompts: %v\n", pid, readyErr)
 	} else if err := waitNamed(pid, name); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: -n %s may not find session %d yet: %v\n", name, pid, err)
 	}
@@ -361,14 +435,22 @@ func startSession(o options, prompt string) error {
 	// everything a person reads goes to stderr.
 	fmt.Println(pid)
 	fmt.Fprintf(os.Stderr, "started claude in %s as %q (pid %d)\n", dir, name, pid)
+	if o.quit {
+		fmt.Fprintf(os.Stderr, "session %d will end once this prompt's turn is done\n", pid)
+	}
 	return nil
 }
 
 // reuseSession stands in for a launch whose session is already running: the
 // prompt, if any, is injected instead of opening a second session, and the PID
 // is printed just as a launch prints it.
-func reuseSession(s sessions.Session, prompt string) error {
-	if prompt != "" {
+func reuseSession(s sessions.Session, prompt string, quit bool) error {
+	switch {
+	case quit:
+		if err := promptThenQuit(s.PID, prompt); err != nil {
+			return err
+		}
+	case prompt != "":
 		if err := injectPrompt(s.PID, prompt); err != nil {
 			return err
 		}
@@ -538,6 +620,107 @@ func quitSession(pid uint32) error {
 	}
 	fmt.Fprintf(os.Stderr, "session %d terminated\n", pid)
 	return nil
+}
+
+// quitAtEndOfTurn is -q on its own. /exit takes effect the moment it is typed,
+// turn or no turn, so a session is only ever sent it between turns: one that is
+// idle now ends now, and one that is mid-turn is left to a background watcher
+// that ends it once the turn is done, so this command does not block for as
+// long as that turn takes.
+func quitAtEndOfTurn(pid uint32) error {
+	if err := checkSession(pid); err != nil {
+		return err
+	}
+	// Without a readable record there is no turn to wait for that could be told
+	// apart from a session that never reports one; ending it is what was asked.
+	if a, err := sessions.ActivityOf(pid); err != nil || a.Status == "idle" {
+		return quitSession(pid)
+	}
+	if err := watchQuit(pid, time.Time{}); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "session %d is mid-turn; it will end once that turn is done\n", pid)
+	return nil
+}
+
+// promptThenQuit is -q with a prompt: the prompt is injected, and the session
+// ends once the turn that prompt starts is done.
+func promptThenQuit(pid uint32, prompt string) error {
+	since := time.Now()
+	if err := injectPrompt(pid, prompt); err != nil {
+		return err
+	}
+	if err := watchQuit(pid, since); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "session %d will end once this prompt's turn is done\n", pid)
+	return nil
+}
+
+// watchQuit starts the background watcher that ends the session at the end of
+// its turn: the first time its record reports it idle with a change made after
+// since. It is a separate, detached process so that the caller gets its answer
+// -- and, with -d, the PID -- now, rather than when the turn is over.
+func watchQuit(pid uint32, since time.Time) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	start := func(flags uint32) error {
+		cmd := exec.Command(exe, quitCmd, strconv.FormatUint(uint64(pid), 10), strconv.FormatInt(since.UnixMilli(), 10))
+		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: flags}
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		return cmd.Process.Release()
+	}
+	// Detached from this console, in a process group of its own and, where the
+	// job allows it, out of the caller's job: the caller's tool call ending
+	// must not take the watcher with it (see launch.Start).
+	const base = windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP
+	if err := start(base | windows.CREATE_BREAKAWAY_FROM_JOB); err != nil {
+		if err := start(base); err != nil {
+			return fmt.Errorf("start the watcher that ends session %d: %w", pid, err)
+		}
+	}
+	return nil
+}
+
+// runQuitWatch is the internal subcommand behind watchQuit.
+func runQuitWatch(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: ccrun %s <pid> <since-unix-ms>", quitCmd)
+	}
+	pid64, err := strconv.ParseUint(args[0], 10, 32)
+	if err != nil {
+		return fmt.Errorf("bad pid %q: %w", args[0], err)
+	}
+	ms, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return fmt.Errorf("bad time %q: %w", args[1], err)
+	}
+	pid := uint32(pid64)
+	since := time.UnixMilli(ms)
+
+	deadline := time.Now().Add(quitWatchLimit)
+	for time.Now().Before(deadline) {
+		a, err := sessions.ActivityOf(pid)
+		switch {
+		case err != nil:
+			// A record caught mid-write fails to parse; a session that has gone
+			// leaves nothing to end.
+			if !coninject.Alive(pid) {
+				return nil
+			}
+		// Idle for idleSettle, not merely idle: a prompt queued behind the turn
+		// starts the next one straight away, and ending the session in that gap
+		// would drop it.
+		case a.Status == "idle" && a.Since.After(since) && time.Since(a.Since) >= idleSettle:
+			return quitSession(pid)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("session %d did not finish its turn within %s; leaving it running", pid, quitWatchLimit)
 }
 
 // listSessions prints the running sessions that match every keyword, so a

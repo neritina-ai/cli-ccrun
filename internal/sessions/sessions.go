@@ -10,6 +10,7 @@ package sessions
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -97,6 +98,37 @@ func Running() ([]Session, error) {
 	}
 	slices.SortFunc(found, func(a, b Session) int { return a.Started.Compare(b.Started) })
 	return found, nil
+}
+
+// Activity is what a session's record says it is doing right now.
+type Activity struct {
+	Status string    // "busy", "idle", ... as Claude Code reports it
+	Since  time.Time // when Status last changed
+}
+
+// ActivityOf reads the record of the session with this PID alone, which is
+// cheap enough to poll. It fails once the session has exited, or when the
+// record belongs to a process that no longer holds the PID.
+func ActivityOf(pid uint32) (Activity, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return Activity{}, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "sessions", strconv.FormatUint(uint64(pid), 10)+".json"))
+	if err != nil {
+		return Activity{}, err
+	}
+	var r struct {
+		record
+		StatusUpdatedAt int64 `json:"statusUpdatedAt"` // Unix milliseconds
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return Activity{}, err
+	}
+	if r.PID != pid || !sameProcess(r.record) {
+		return Activity{}, fmt.Errorf("the record for pid %d belongs to an earlier process", pid)
+	}
+	return Activity{Status: r.Status, Since: time.UnixMilli(r.StatusUpdatedAt)}, nil
 }
 
 // sameProcess reports whether the record was written by the process that now

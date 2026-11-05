@@ -10,12 +10,12 @@ under a name you choose, prints its PID, and takes that name or PID for
 everything after:
 
 ```
-ccrun -d <working-dir> [-n <name>] [prompt]          start a session, or prompt the one
+ccrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or prompt the one
                                                      already running; prints its PID
-ccrun -n <name> <prompt>                             inject a prompt into that session
-ccrun -n <name> -                                    inject a prompt read from stdin
+ccrun -n <name> <prompt> [-q]                        inject a prompt into that session
+ccrun -n <name> - [-q]                               inject a prompt read from stdin
 ccrun -n <name> -s                                   print what that session is showing
-ccrun -n <name> -q                                   end that session
+ccrun -n <name> -q                                   end that session once its turn is done
 ccrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
 ccrun -l [keyword ...]                               list running sessions and their PIDs
 ccrun -m <old-dir> <new-dir>                         after a working directory was renamed or
@@ -154,11 +154,30 @@ stdout is the screen either way.
 
 ```
 ccrun -n nightly-build -q
+ccrun -n nightly-build "write the release notes" -q
+ccrun -d D:\work\once "run the release checklist" -q
 ```
 
-`/exit` is queued behind whatever the session is doing, so it gets 10 seconds; a
-session that has not gone by then is terminated. Claude Code writes its
-transcript as it goes, so either way the conversation is still there to resume.
+`-q` ends a session at the end of its turn, never in the middle of one. A
+session that is idle ends right away, and ccrun reports it gone. A session that
+is still working -- including one waiting on a background command or monitor
+it started -- is left to finish: ccrun returns at once, and a small background
+process ends the session once it has been idle for a few seconds. A turn can
+take hours, so nothing waits on it in the foreground.
+
+With a prompt, `-q` injects it and ends the session once the turn that prompt
+starts is done, which saves a second call. With `-d` it makes a one-off run:
+the session starts with the prompt, the PID is printed as usual, and the
+session closes itself when it has finished. `-d` with `-q` needs a prompt.
+
+The session is ended with `/exit`; one that has not gone 10 seconds later is
+terminated. A session that has not finished its turn after 24 hours is left
+running. Claude Code writes its transcript as it goes, so either way the
+conversation is still there to resume.
+
+Flags can come before or after the prompt. A prompt is one argument however
+many words it has, so a dash inside a quoted prompt is never taken for a flag;
+anything after `--` is taken as prompt text.
 
 ### Rename a working directory
 
@@ -206,6 +225,9 @@ the other per-directory settings in `~/.claude.json` stay with the old path;
   not show it. So before minimizing a session window you have been reading,
   look at its title and press Escape if it shows a selection -- only then,
   because Escape anywhere else interrupts Claude Code.
+- `-q` tells the end of a turn from the same session record: its status reads
+  `idle` only once the session has nothing left to do, background commands and
+  monitors included.
 - Injecting a prompt, and `-q`, end such a selection first and say so on
   stderr. They do it by sending Escape to the window, which the console keeps
   for itself while selecting, and only when there is a selection. A selection
