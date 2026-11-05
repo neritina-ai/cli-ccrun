@@ -163,7 +163,8 @@ session that is idle ends right away, and ccrun reports it gone. A session that
 is still working -- including one waiting on a background command or monitor
 it started -- is left to finish: ccrun returns at once, and a small background
 process ends the session once it has been idle for a few seconds. A turn can
-take hours, so nothing waits on it in the foreground.
+take hours or days, so nothing waits on it in the foreground, and nothing gives
+up on it either.
 
 With a prompt, `-q` injects it and ends the session once the turn that prompt
 starts is done, which saves a second call. With `-d` it makes a one-off run:
@@ -171,8 +172,7 @@ the session starts with the prompt, the PID is printed as usual, and the
 session closes itself when it has finished. `-d` with `-q` needs a prompt.
 
 The session is ended with `/exit`; one that has not gone 10 seconds later is
-terminated. A session that has not finished its turn after 24 hours is left
-running. Claude Code writes its transcript as it goes, so either way the
+terminated. Claude Code writes its transcript as it goes, so either way the
 conversation is still there to resume.
 
 Flags can come before or after the prompt. A prompt is one argument however

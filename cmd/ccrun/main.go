@@ -73,10 +73,6 @@ const (
 	// takes that for the end of its turn rather than a gap between two.
 	idleSettle = 3 * time.Second
 
-	// quitWatchLimit bounds how long a waiting -q keeps watching a session that
-	// never finishes its turn -- one stuck on a permission prompt, say.
-	quitWatchLimit = 24 * time.Hour
-
 	// exitError is the exit code for any failure; success is always 0.
 	exitError = 1
 
@@ -702,25 +698,28 @@ func runQuitWatch(args []string) error {
 	pid := uint32(pid64)
 	since := time.UnixMilli(ms)
 
-	deadline := time.Now().Add(quitWatchLimit)
-	for time.Now().Before(deadline) {
-		a, err := sessions.ActivityOf(pid)
-		switch {
-		case err != nil:
-			// A record caught mid-write fails to parse; a session that has gone
-			// leaves nothing to end.
-			if !coninject.Alive(pid) {
-				return nil
-			}
+	// There is no time limit: a one-off run can take days. What ends the watch
+	// instead is the session going away, told by its process creation time so
+	// that a PID Windows hands to another process -- another session, even --
+	// is never taken for this one.
+	born, err := coninject.StartTime(pid)
+	if err != nil {
+		return fmt.Errorf("session %d: %w", pid, err)
+	}
+	for {
+		if t, err := coninject.StartTime(pid); err != nil || t != born {
+			return nil
+		}
+		// A record caught mid-write fails to parse, and is read again next time.
+		//
 		// Idle for idleSettle, not merely idle: a prompt queued behind the turn
 		// starts the next one straight away, and ending the session in that gap
 		// would drop it.
-		case a.Status == "idle" && a.Since.After(since) && time.Since(a.Since) >= idleSettle:
+		if a, err := sessions.ActivityOf(pid); err == nil && a.Status == "idle" && a.Since.After(since) && time.Since(a.Since) >= idleSettle {
 			return quitSession(pid)
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return fmt.Errorf("session %d did not finish its turn within %s; leaving it running", pid, quitWatchLimit)
 }
 
 // listSessions prints the running sessions that match every keyword, so a
