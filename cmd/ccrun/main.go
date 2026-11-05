@@ -99,11 +99,6 @@ const (
 	// name it was launched with, which takes a second or two.
 	nameGrace = 10 * time.Second
 
-	// quitGrace is how long "-q" waits for /exit to take effect. /exit acts the
-	// moment it is typed, even mid-turn, which is why -q only sends it once the
-	// turn is over; this covers a session slow to shut down.
-	quitGrace = 10 * time.Second
-
 	// trustMarker identifies the workspace-trust prompt in the session's visible
 	// console text, lowercased.
 	trustMarker = "trust this folder"
@@ -583,12 +578,9 @@ func showScreen(pid uint32) error {
 	return nil
 }
 
-// quitSession ends the session, and makes sure it ends. /exit is the polite way
-// and is what a session almost always takes; a session that has not gone after
-// quitGrace is terminated instead. Nobody is asked to confirm that: "end this
-// session" is not ambiguous, and reporting failure would only hand the same kill
-// back to a caller with no better tool for it. Claude Code writes its transcript
-// as it goes, so a terminated session is still there to resume.
+// quitSession sends the session /exit, once. A session that does not take it
+// is left for a person to close: one left running costs nothing, and nothing
+// is ever killed on a guess.
 func quitSession(pid uint32) error {
 	if err := checkSession(pid); err != nil {
 		return err
@@ -596,25 +588,7 @@ func quitSession(pid uint32) error {
 	if _, err := helper(pid, "quit", ""); err != nil {
 		return err
 	}
-	if coninject.WaitExit(pid, quitGrace, 250*time.Millisecond) {
-		fmt.Fprintf(os.Stderr, "session %d exited\n", pid)
-		return nil
-	}
-
-	// Checked again because the PID has been out of sight for quitGrace, and
-	// terminating whatever inherited a recycled PID would be worse than leaving
-	// this session running.
-	if err := checkSession(pid); err != nil {
-		return fmt.Errorf("session %d did not exit within %s, and is no longer safe to terminate: %w", pid, quitGrace, err)
-	}
-	fmt.Fprintf(os.Stderr, "session %d ignored /exit for %s; terminating\n", pid, quitGrace)
-	if err := coninject.Terminate(pid); err != nil {
-		return err
-	}
-	if !coninject.WaitExit(pid, 3*time.Second, 100*time.Millisecond) {
-		return fmt.Errorf("session %d is still running after being terminated", pid)
-	}
-	fmt.Fprintf(os.Stderr, "session %d terminated\n", pid)
+	fmt.Fprintf(os.Stderr, "sent /exit to session %d\n", pid)
 	return nil
 }
 

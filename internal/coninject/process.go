@@ -2,7 +2,6 @@ package coninject
 
 import (
 	"fmt"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -97,36 +96,4 @@ func Alive(pid uint32) bool {
 	}
 	const stillActive = 259 // STILL_ACTIVE
 	return code == stillActive
-}
-
-// Terminate kills pid outright. It is the last resort behind a graceful exit,
-// so a process that has already gone is not an error.
-func Terminate(pid uint32) error {
-	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pid)
-	if err != nil {
-		if !Alive(pid) {
-			return nil
-		}
-		return fmt.Errorf("open pid %d for terminate: %w", pid, err)
-	}
-	defer windows.CloseHandle(h)
-	if err := windows.TerminateProcess(h, 1); err != nil && Alive(pid) {
-		return fmt.Errorf("terminate pid %d: %w", pid, err)
-	}
-	return nil
-}
-
-// WaitExit blocks until pid is gone or timeout elapses, reporting whether it
-// exited.
-func WaitExit(pid uint32, timeout, poll time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if !Alive(pid) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(poll)
-	}
 }

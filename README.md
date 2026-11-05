@@ -171,9 +171,9 @@ starts is done, which saves a second call. With `-d` it makes a one-off run:
 the session starts with the prompt, the PID is printed as usual, and the
 session closes itself when it has finished. `-d` with `-q` needs a prompt.
 
-The session is ended with `/exit`; one that has not gone 10 seconds later is
-terminated. Claude Code writes its transcript as it goes, so either way the
-conversation is still there to resume.
+The session is sent `/exit`, once. ccrun never kills a session: one that does
+not take `/exit` keeps running until someone closes it, and its conversation is
+there to resume either way.
 
 Flags can come before or after the prompt. A prompt is one argument however
 many words it has, so a dash inside a quoted prompt is never taken for a flag;
