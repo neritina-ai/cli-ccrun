@@ -10,7 +10,8 @@
 //
 // Forms:
 //
-//	ccrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or reuse it
+//	ccrun -d <working-dir> [-n <name>] [prompt] [-q] [-- <claude-arg> ...]
+//	                                                     start a session, or reuse it
 //	ccrun -n <name> <prompt> [-q]                        inject a prompt
 //	ccrun -n <name> - [-q]                               inject a prompt from stdin
 //	ccrun -n <name> -s                                   print what the session shows
@@ -18,6 +19,9 @@
 //	ccrun -p <pid> <prompt> | - | -s | -q                the same, by PID
 //	ccrun -l [keyword ...]                               find sessions and their PIDs
 //	ccrun -m <old-dir> <new-dir>                         carry a moved directory's data over
+//
+// The first "--" ends ccrun's own arguments: whatever follows it is passed to
+// the claude that -d starts, as it is, after the arguments ccrun gives it.
 //
 // Two internal forms, spawned by the public ones:
 //
@@ -48,6 +52,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -113,7 +118,8 @@ const (
 const usage = `ccrun - start and drive Claude Code sessions by PID
 
 usage:
-  ccrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or prompt the one
+  ccrun -d <working-dir> [-n <name>] [prompt] [-q] [-- <claude-arg> ...]
+                                                       start a session, or prompt the one
                                                        already running; prints its PID
   ccrun -n <name> <prompt> [-q]                        inject a prompt into that session
   ccrun -n <name> - [-q]                               inject a prompt read from stdin
@@ -140,8 +146,11 @@ options:
                included -- ends once it is done, while ccrun returns at once.
                With a prompt, the session ends once that prompt's turn is
                done; with -d, a prompt is required
-  --           everything after it is prompt text; flags may otherwise come
-               before or after the prompt
+  --           ends ccrun's arguments: with -d, everything after it goes to
+               claude as it is, after the arguments ccrun gives claude itself.
+               Flags and the prompt go before it, in any order. --name, -n and
+               --remote-control are ccrun's to give and are refused after it;
+               no other form takes a --
   -l           list running sessions, one per line with the PID first; with
                keywords, only those whose name, directory or session ID
                contains every keyword (case-insensitive)
@@ -180,20 +189,22 @@ func main() {
 		list   = fs.Bool("l", false, "list running sessions matching every keyword")
 		move   = fs.Bool("m", false, "move what Claude Code keeps for a working directory that moved")
 	)
-	args, err := parseInterleaved(fs, os.Args[1:])
+	args, claude, dashdash, err := parseArgs(fs, os.Args[1:])
 	if err != nil {
 		os.Exit(exitError)
 	}
 
 	err = run(options{
-		dir:    *dir,
-		pid:    uint32(*pid),
-		name:   *name,
-		screen: *screen,
-		quit:   *quit,
-		list:   *list,
-		move:   *move,
-		args:   args,
+		dir:      *dir,
+		pid:      uint32(*pid),
+		name:     *name,
+		screen:   *screen,
+		quit:     *quit,
+		list:     *list,
+		move:     *move,
+		args:     args,
+		claude:   claude,
+		dashdash: dashdash,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ccrun:", err)
@@ -201,47 +212,60 @@ func main() {
 	}
 }
 
-// parseInterleaved parses flags wherever they stand among the arguments, so
-// that "ccrun -p <pid> <prompt> -q" means what it reads as; the flag package
-// alone stops at the first argument that is not a flag. A prompt is still one
-// argument however many words it has, so a dash inside it is never mistaken
-// for a flag; only an argument that is a flag on its own is. Everything after
-// "--" is taken as it is.
-func parseInterleaved(fs *flag.FlagSet, all []string) ([]string, error) {
-	var rest []string
-	args := all
+// parseArgs parses ccrun's command line, which the first "--" splits in two.
+//
+// What follows the "--" is claude's: it comes back as claude, untouched --
+// nothing in it is taken for one of ccrun's flags, and each argument stays
+// the one argument it was. dashdash reports whether there was a "--" at all,
+// so that one with nothing after it can still be refused where nothing may go
+// to claude. A flag cannot take "--" as its value: it is always the split.
+//
+// What comes before it is ccrun's own, and its flags are parsed wherever they
+// stand among the arguments, so that "ccrun -p <pid> <prompt> -q" means what it
+// reads as; the flag package alone stops at the first argument that is not a
+// flag. A prompt is still one argument however many words it has, so a dash
+// inside it is never mistaken for a flag; only an argument that is a flag on
+// its own is. The rest comes back as args.
+func parseArgs(fs *flag.FlagSet, all []string) (args, claude []string, dashdash bool, err error) {
+	own := all
+	if i := slices.Index(all, "--"); i >= 0 {
+		own, claude, dashdash = all[:i], slices.Clone(all[i+1:]), true
+	}
 	for {
-		if err := fs.Parse(args); err != nil {
-			return nil, err
+		if err := fs.Parse(own); err != nil {
+			return nil, nil, false, err
 		}
-		args = fs.Args()
-		if len(args) == 0 {
-			return rest, nil
+		own = fs.Args()
+		if len(own) == 0 {
+			return args, claude, dashdash, nil
 		}
-		// The flag package consumes a "--" and reports everything after it as
-		// arguments. args is always a tail of all, so whether it did is told by
-		// the argument just before that tail.
-		if i := len(all) - len(args); i > 0 && all[i-1] == "--" {
-			return append(rest, args...), nil
-		}
-		rest = append(rest, args[0])
-		args = args[1:]
+		args = append(args, own[0])
+		own = own[1:]
 	}
 }
 
 type options struct {
-	dir    string
-	pid    uint32
-	name   string
-	screen bool
-	quit   bool
-	list   bool
-	move   bool
-	args   []string
+	dir      string
+	pid      uint32
+	name     string
+	screen   bool
+	quit     bool
+	list     bool
+	move     bool
+	args     []string
+	claude   []string // the arguments after "--", for claude
+	dashdash bool     // whether there was a "--", even with nothing after it
 }
 
 // run dispatches to one of the public forms.
 func run(o options) error {
+	// Only a launch has a claude to hand arguments to. A "--" anywhere else is
+	// refused even with nothing after it: the caller either has something for
+	// claude or expects "--" to protect a prompt, and neither would happen.
+	if o.dashdash && o.dir == "" {
+		return fmt.Errorf("only -d starts claude, so only -d takes arguments after --; a prompt goes before --\n%s", usage)
+	}
+
 	switch {
 	case o.move:
 		if o.pid != 0 || o.name != "" || o.dir != "" || o.screen || o.quit || o.list || len(o.args) != 2 {
@@ -258,6 +282,9 @@ func run(o options) error {
 	case o.dir != "":
 		if o.pid != 0 || o.screen {
 			return fmt.Errorf("-d starts a new session; -p and -s act on a running one\n%s", usage)
+		}
+		if a := ccrunsOwn(o.claude); a != "" {
+			return fmt.Errorf("%s after -- is ccrun's to give claude: ccrun gives it the session's name, which is what -n and -l find the session by; name the session with -n, before --", a)
 		}
 		prompt, err := readPrompt(o.args)
 		if err != nil {
@@ -365,7 +392,7 @@ func startSession(o options, prompt string) error {
 	}
 	switch {
 	case len(taken) == 1 && sameDir(taken[0].Dir, abs):
-		return reuseSession(taken[0], prompt, o.quit)
+		return reuseSession(taken[0], prompt, o.quit, len(o.claude) > 0)
 	case len(taken) == 1:
 		return fmt.Errorf("session %d is already named %q and works in %s, not %s; end that one (ccrun -n %q -q) or give this one another name with -n", taken[0].PID, name, taken[0].Dir, abs, name)
 	case len(taken) > 1:
@@ -381,20 +408,9 @@ func startSession(o options, prompt string) error {
 		return fmt.Errorf("claude not found on PATH: %w", err)
 	}
 
-	// --name is the session's own name: its prompt box, terminal title and
-	// /resume picker show it, its session record carries it for -n to find, and
-	// claude --resume keeps it. --remote-control turns Remote Control on, and
-	// gets the same name so that the Remote Control list shows the same thing;
-	// it can only be read back on claude.ai, so it could never be what -n goes
-	// by.
-	args := []string{"--remote-control", name, "--name", name}
-	if prompt != "" {
-		args = append(args, prompt)
-	}
-
 	pid, err := launch.Start(launch.Options{
 		Exe:  exe,
-		Args: args,
+		Args: launchArgs(name, prompt, o.claude),
 		Dir:  dir,
 		Env:  launch.SessionEnv(),
 	})
@@ -432,10 +448,49 @@ func startSession(o options, prompt string) error {
 	return nil
 }
 
+// launchArgs is claude's command line after the executable. --name is the
+// session's own name: its prompt box, terminal title and /resume picker show
+// it, its session record carries it for -n to find, and claude --resume keeps
+// it. --remote-control turns Remote Control on, and gets the same name so that
+// the Remote Control list shows the same thing; it can only be read back on
+// claude.ai, so it could never be what -n goes by.
+//
+// The arguments after ccrun's "--" come last, as they are. Last rather than
+// first, because claude takes options after the prompt, while one of them that
+// takes a list of values would swallow a prompt that came after it.
+func launchArgs(name, prompt string, claude []string) []string {
+	args := []string{"--remote-control", name, "--name", name}
+	if prompt != "" {
+		args = append(args, prompt)
+	}
+	return append(args, claude...)
+}
+
+// ccrunsOwn returns the first argument meant for claude that sets what
+// launchArgs already does -- the session's name or its Remote Control -- or ""
+// when none does. Such an argument is refused rather than dropped or left to
+// win: leaving it out would rewrite what the caller passed, and letting it win
+// would give the session a name that -n and -l do not know it by.
+func ccrunsOwn(claude []string) string {
+	for _, a := range claude {
+		opt, _, _ := strings.Cut(a, "=")
+		switch {
+		case opt == "--name", opt == "--remote-control":
+			return a
+		case strings.HasPrefix(a, "-n"): // -n <name> or -n<name>
+			return a
+		}
+	}
+	return ""
+}
+
 // reuseSession stands in for a launch whose session is already running: the
 // prompt, if any, is injected instead of opening a second session, and the PID
-// is printed just as a launch prints it.
-func reuseSession(s sessions.Session, prompt string, quit bool) error {
+// is printed just as a launch prints it. Arguments for claude have nothing to
+// go to there, which is said rather than passed over: a schedule that keeps
+// one session going passes them on every run, and they reach claude on the run
+// that starts it.
+func reuseSession(s sessions.Session, prompt string, quit, claudeArgs bool) error {
 	switch {
 	case quit:
 		if err := promptThenQuit(s.PID, prompt); err != nil {
@@ -448,6 +503,9 @@ func reuseSession(s sessions.Session, prompt string, quit bool) error {
 	}
 	fmt.Println(s.PID)
 	fmt.Fprintf(os.Stderr, "claude is already running in %s as %q (pid %d); no new session started\n", s.Dir, s.Name, s.PID)
+	if claudeArgs {
+		fmt.Fprintln(os.Stderr, "the arguments after -- were not used: they only reach claude when a session starts")
+	}
 	return nil
 }
 

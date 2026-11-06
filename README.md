@@ -10,7 +10,8 @@ under a name you choose, prints its PID, and takes that name or PID for
 everything after:
 
 ```
-ccrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or prompt the one
+ccrun -d <working-dir> [-n <name>] [prompt] [-q] [-- <claude-arg> ...]
+                                                     start a session, or prompt the one
                                                      already running; prints its PID
 ccrun -n <name> <prompt> [-q]                        inject a prompt into that session
 ccrun -n <name> - [-q]                               inject a prompt read from stdin
@@ -77,6 +78,36 @@ and no Remote Control.
 The session's window starts minimized and never takes focus, so starting one --
 or ten -- does not interrupt whatever you are doing. It is on the taskbar if you
 want to open it and take over by hand.
+
+### Pass arguments to claude
+
+```
+ccrun -d D:\work\bot -n mybot "it is 8:30" -- --dangerously-load-development-channels server:webhook
+ccrun -d D:\work\nightly -- --model opus --continue
+```
+
+The first `--` ends ccrun's own arguments, and everything after it goes to
+claude as it is: in order, after the arguments ccrun gives claude itself
+(`--remote-control <name> --name <name>`, then the prompt). Nothing after it is
+read as one of ccrun's flags or as prompt text, and each argument arrives as the
+one argument it was, spaces and quotes included. So ccrun's flags and the
+prompt all go before `--`, in any order.
+
+`--name`, `-n` and `--remote-control` are refused after `--`, and nothing
+starts: ccrun gives claude both itself, with the session's name, and that name
+is what `-n` and `-l` find the session by. Name the session with ccrun's own
+`-n`, before `--`.
+
+Only a launch takes arguments for claude. Every other form -- `-n` or `-p`
+without `-d`, `-s`, `-q`, `-l`, `-m` -- refuses a `--`, even one with nothing
+after it. When `-d` finds its session already running and only prompts it, the
+arguments have no claude to go to, and a note on stderr says they were not used.
+A scheduled `ccrun -d` that keeps one session going can pass them every time:
+they reach claude on the run that starts the session.
+
+Flags can come before or after the prompt. A prompt is one argument however
+many words it has, so a dash inside a quoted prompt is never taken for a flag;
+a prompt that starts with a dash would be, so pipe that one in with `-`.
 
 ### Pick a session by name or PID
 
@@ -174,10 +205,6 @@ session closes itself when it has finished. `-d` with `-q` needs a prompt.
 The session is sent `/exit`, once. ccrun never kills a session: one that does
 not take `/exit` keeps running until someone closes it, and its conversation is
 there to resume either way.
-
-Flags can come before or after the prompt. A prompt is one argument however
-many words it has, so a dash inside a quoted prompt is never taken for a flag;
-anything after `--` is taken as prompt text.
 
 ### Rename a working directory
 
